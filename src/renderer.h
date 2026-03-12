@@ -8,18 +8,21 @@
 //
 // Core design:
 //   - All quads live in one flat CPU array.
-//   - Each render target records a (start, count) slice of that array.
-//   - r2d_set_target() switches which target receives new quads.
+//   - Each render target owns a list of (start, count) slices into
+//     that array, one slice per r2d_set_target() call this frame.
+//     This means you can switch targets freely and come back to
+//     the same target multiple times; each visit appends a new slice.
 //   - r2d_end_frame() iterates every registered target in registration
-//     order and flushes its slice.
+//     order and flushes all of its slices with one draw call each.
 //   - Each target can override the pipeline (e.g. picking uses a
 //     different fragment shader and a GL_R32UI fbo).
 //   - Targets flagged composite_to_screen are blitted onto the
 //     default framebuffer at the very end of end_frame.
 // ============================================================
 
-#define R2D_MAX_QUADS   kilobytes(32)
-#define R2D_MAX_TARGETS 16
+#define R2D_MAX_QUADS              kilobytes(32)
+#define R2D_MAX_TARGETS            16
+#define R2D_MAX_SLICES_PER_TARGET  32
 
 // ----------------------------------------------------------------
 // Quad  (GPU instance data)
@@ -72,9 +75,11 @@ struct R2D_Render_Target
   u32    width;
   u32    height;
 
-  // Per-frame quad slice (filled during submission, consumed at end_frame)
-  u32 quad_start;         // index into R2D_Context.quads[]
-  u32 quad_count;
+  // Per-frame quad slices (one per r2d_set_target call this frame).
+  // Each slice is an independent range in R2D_Context.quads[].
+  u32 slice_starts[R2D_MAX_SLICES_PER_TARGET];
+  u32 slice_counts[R2D_MAX_SLICES_PER_TARGET];
+  u32 slice_count;
 
   // Optional pipeline override. NULL = use R2D_Context.default_pipeline.
   R2D_Pipeline *pipeline_override;
@@ -86,6 +91,24 @@ struct R2D_Render_Target
   // When true, this target's texture is composited onto the screen at
   // end_frame. Ignored for the screen target itself (fbo == 0).
   b8 composite_to_screen;
+};
+
+// ----------------------------------------------------------------
+// Frame Stats
+// Filled by r2d_end_frame, available to read after it returns.
+// GPU time is measured with a GL_TIME_ELAPSED query and is the
+// total time the GPU spent on all draw calls this frame.
+// ----------------------------------------------------------------
+
+typedef struct R2D_Frame_Stats R2D_Frame_Stats;
+struct R2D_Frame_Stats
+{
+  u32 draw_calls;       // total glDraw* calls issued (including blits)
+  u32 quads_drawn;      // total quad instances drawn (excluding blit quads)
+  u32 targets_flushed;  // number of registered targets that had geometry
+  u32 slices_total;     // total slices flushed across all targets
+  f32 gpu_time_ms;      // GPU time for the whole frame in milliseconds
+                        // (one frame behind: result arrives after GPU finishes)
 };
 
 // ----------------------------------------------------------------
@@ -123,11 +146,13 @@ struct R2D_Context
   // The screen target (fbo == 0). Registered automatically by r2d_init.
   R2D_Render_Target *screen_target;
 
-  struct
-  {
-    u32 draw_calls;
-    u32 quads_drawn;
-  } per_frame_debug;
+  // GPU timer query objects (double-buffered to avoid stalling the CPU).
+  // We write to query[frame & 1] and read from query[!frame & 1].
+  u32 gpu_timer_queries[2];
+  u32 gpu_timer_frame;  // incremented each end_frame, used to index the pair
+
+  // Stats for the most recently completed frame, ready to read after end_frame.
+  R2D_Frame_Stats frame_stats;
 };
 
 // ----------------------------------------------------------------

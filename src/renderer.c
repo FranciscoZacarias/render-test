@@ -266,6 +266,10 @@ r2d_init(u32 window_width, u32 window_height)
     glVertexArrayAttribBinding(R2D_RenderContext.vao, 3, 1);
   }
 
+  // GPU timer queries (double-buffered)
+  glGenQueries(2, R2D_RenderContext.gpu_timer_queries);
+  R2D_RenderContext.gpu_timer_frame = 0;
+
   // Screen target (wraps the default framebuffer, never composited)
   {
     R2D_Render_Target *screen = push_struct(R2D_RenderContext.arena, R2D_Render_Target);
@@ -440,21 +444,34 @@ r2d_render_target_resize(R2D_Render_Target *rt, u32 new_width, u32 new_height)
 
 // ----------------------------------------------------------------
 // r2d_set_target
-// Closes the previous target's slice and opens a new one.
+// Closes the current slice on the previous target and opens a new
+// slice on the new target. Switching to a target you already drew
+// into this frame simply appends another slice -- all slices are
+// flushed independently at end_frame, preserving submission order.
 // ----------------------------------------------------------------
 
 function void
 r2d_set_target(R2D_Render_Target *rt)
 {
-  // Close the previous target's slice
+  // Close the current slice on the previous target
   if (R2D_RenderContext.active_target != NULL)
   {
     R2D_Render_Target *prev = R2D_RenderContext.active_target;
-    prev->quad_count = R2D_RenderContext.quads_count - prev->quad_start;
+    u32 s = prev->slice_count - 1;
+    prev->slice_counts[s] = R2D_RenderContext.quads_count - prev->slice_starts[s];
   }
 
-  rt->quad_start  = R2D_RenderContext.quads_count;
-  rt->quad_count  = 0;
+  // Open a new slice on the incoming target
+  if (rt->slice_count >= R2D_MAX_SLICES_PER_TARGET)
+  {
+    r2d_error(S("Too many slices for render target. Increase R2D_MAX_SLICES_PER_TARGET."));
+    return;
+  }
+
+  u32 s = rt->slice_count++;
+  rt->slice_starts[s] = R2D_RenderContext.quads_count;
+  rt->slice_counts[s] = 0;
+
   R2D_RenderContext.active_target = rt;
 }
 
@@ -521,40 +538,45 @@ r2d_begin_frame()
 {
   R2D_RenderContext.quads_count = 0;
 
-  R2D_RenderContext.per_frame_debug.draw_calls  = 0;
-  R2D_RenderContext.per_frame_debug.quads_drawn = 0;
+  R2D_RenderContext.frame_stats.draw_calls      = 0;
+  R2D_RenderContext.frame_stats.quads_drawn     = 0;
+  R2D_RenderContext.frame_stats.targets_flushed = 0;
+  R2D_RenderContext.frame_stats.slices_total    = 0;
+  // gpu_time_ms is populated at end_frame from the previous frame's query
 
   for (u32 i = 0; i < R2D_RenderContext.target_count; i += 1)
   {
     R2D_Render_Target *rt = R2D_RenderContext.targets[i];
-    rt->quad_start = 0;
-    rt->quad_count = 0;
+    rt->slice_count = 0;
   }
 
-  // Re-open the active target's slice from position 0
+  // Re-open the active target with a fresh first slice
   if (R2D_RenderContext.active_target != NULL)
   {
-    R2D_RenderContext.active_target->quad_start = 0;
+    R2D_Render_Target *at = R2D_RenderContext.active_target;
+    at->slice_count     = 1;
+    at->slice_starts[0] = 0;
+    at->slice_counts[0] = 0;
   }
 }
 
 // ----------------------------------------------------------------
 // _r2d_flush_target
-// Uploads the target's quad slice and issues one instanced draw.
+// Uploads each of the target's slices and issues one instanced draw
+// per slice. Slices are flushed in submission order, so interleaved
+// drawing across targets is reproduced correctly.
 // ----------------------------------------------------------------
 
 function void
 _r2d_flush_target(R2D_Render_Target *rt)
 {
-  if (rt->quad_count == 0) return;
+  if (rt->slice_count == 0) return;
 
   R2D_Pipeline *pipeline = (rt->pipeline_override != NULL)
                          ? rt->pipeline_override
                          : &R2D_RenderContext.default_pipeline;
 
   glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
-
-
   glViewport(0, 0, (s32)rt->width, (s32)rt->height);
 
   if (rt->clear_flags & R2D_Clear_Color)
@@ -572,23 +594,31 @@ _r2d_flush_target(R2D_Render_Target *rt)
     (f32)rt->width,
     (f32)rt->height);
 
-  R2D_Quad *slice  = R2D_RenderContext.quads + rt->quad_start;
-  u32       count  = rt->quad_count;
-
-  glNamedBufferSubData(R2D_RenderContext.instance_vbo, 0, count * sizeof(R2D_Quad), slice);
-
-  // If this pipeline has a texture sampler, read the unit index from the first
-  // quad's color field and bind it. All quads in a textured batch share one unit.
-  if (pipeline->uniforms.texture_unit >= 0)
+  for (u32 s = 0; s < rt->slice_count; s += 1)
   {
-    u32 unit = slice[0].color;
-    glProgramUniform1i(pipeline->fragment_program_handle, pipeline->uniforms.texture_unit, (s32)unit);
+    u32       count = rt->slice_counts[s];
+    R2D_Quad *slice = R2D_RenderContext.quads + rt->slice_starts[s];
+
+    if (count == 0) continue;
+
+    glNamedBufferSubData(R2D_RenderContext.instance_vbo, 0, count * sizeof(R2D_Quad), slice);
+
+    // If this pipeline has a texture sampler, read the unit index from the
+    // first quad's color field. All quads in a textured slice share one unit.
+    if (pipeline->uniforms.texture_unit >= 0)
+    {
+      u32 unit = slice[0].color;
+      glProgramUniform1i(pipeline->fragment_program_handle, pipeline->uniforms.texture_unit, (s32)unit);
+    }
+
+    glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0, (s32)count);
+
+    R2D_RenderContext.frame_stats.draw_calls  += 1;
+    R2D_RenderContext.frame_stats.quads_drawn += count;
+    R2D_RenderContext.frame_stats.slices_total += 1;
   }
 
-  glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0, (s32)count);
-
-  R2D_RenderContext.per_frame_debug.draw_calls  += 1;
-  R2D_RenderContext.per_frame_debug.quads_drawn += count;
+  R2D_RenderContext.frame_stats.targets_flushed += 1;
 }
 
 // ----------------------------------------------------------------
@@ -635,57 +665,63 @@ _r2d_blit_to_screen(R2D_Render_Target *rt, u32 window_width, u32 window_height)
   glBindVertexArray(R2D_RenderContext.vao);
   glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
-  R2D_RenderContext.per_frame_debug.draw_calls += 1;
+  R2D_RenderContext.frame_stats.draw_calls += 1;
 }
 
 // ----------------------------------------------------------------
 // r2d_end_frame
-// 1. Closes the active target's slice.
-// 2. Flushes every registered target in registration order.
-// 3. Composites targets flagged composite_to_screen onto fbo 0.
+// 1. Closes the last active slice.
+// 2. Reads back the previous frame's GPU timer query.
+// 3. Begins a new GPU timer query.
+// 4. Flushes every registered target in registration order.
+//    Each target clears itself inside _r2d_flush_target, so there
+//    is no separate screen clear here.
+// 5. Composites targets flagged composite_to_screen onto fbo 0.
+// 6. Ends the GPU timer query.
 // ----------------------------------------------------------------
 
 function void
 r2d_end_frame(u32 window_width, u32 window_height)
 {
-  // Close the currently active slice
+  // Close the last open slice on the active target
   if (R2D_RenderContext.active_target != NULL)
   {
     R2D_Render_Target *a = R2D_RenderContext.active_target;
-    a->quad_count = R2D_RenderContext.quads_count - a->quad_start;
+    u32 s = a->slice_count - 1;
+    a->slice_counts[s] = R2D_RenderContext.quads_count - a->slice_starts[s];
   }
 
-  // Clear the screen target first
-  glBindFramebuffer(GL_FRAMEBUFFER, 0);
-  glViewport(0, 0, (s32)window_width, (s32)window_height);
-  R2D_Render_Target *screen = R2D_RenderContext.screen_target;
-  if (screen->clear_flags & R2D_Clear_Color)
+  // Read back the GPU timer from the query we issued two frames ago.
+  // The double-buffer means we never stall waiting for the result.
+  u32 read_slot  = R2D_RenderContext.gpu_timer_frame & 1;
+  u32 write_slot = read_slot ^ 1;
+
+  if (R2D_RenderContext.gpu_timer_frame >= 2)
   {
-    glClearColor(screen->clear_color.x, screen->clear_color.y, screen->clear_color.z, screen->clear_color.w);
-    glClear(GL_COLOR_BUFFER_BIT);
+    GLuint64 elapsed_ns = 0;
+    glGetQueryObjectui64v(R2D_RenderContext.gpu_timer_queries[read_slot],
+                          GL_QUERY_RESULT, &elapsed_ns);
+    R2D_RenderContext.frame_stats.gpu_time_ms = (f32)(elapsed_ns / 1000000.0);
   }
 
-  // Flush each target
+  // Begin GPU timer for this frame
+  glBeginQuery(GL_TIME_ELAPSED, R2D_RenderContext.gpu_timer_queries[write_slot]);
+
+  // Flush each target. _r2d_flush_target handles clearing, so there is no
+  // separate screen clear here -- that was a redundant double-clear.
   for (u32 i = 0; i < R2D_RenderContext.target_count; i += 1)
   {
     R2D_Render_Target *rt = R2D_RenderContext.targets[i];
+    _r2d_flush_target(rt);
 
-    if (rt->fbo == 0)
+    if (rt->fbo != 0 && rt->composite_to_screen)
     {
-      // Screen target: flush directly to the default framebuffer
-      _r2d_flush_target(rt);
-    }
-    else
-    {
-      // Off-screen target: flush to its FBO, then optionally composite
-      _r2d_flush_target(rt);
-
-      if (rt->composite_to_screen)
-      {
-        _r2d_blit_to_screen(rt, window_width, window_height);
-      }
+      _r2d_blit_to_screen(rt, window_width, window_height);
     }
   }
+
+  glEndQuery(GL_TIME_ELAPSED);
+  R2D_RenderContext.gpu_timer_frame += 1;
 }
 
 // ----------------------------------------------------------------
