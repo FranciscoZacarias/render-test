@@ -47,7 +47,8 @@ struct R2D_Pipeline
 
   struct
   {
-    s32 screen_size;  // vec2 – pixel dimensions of the active target
+    s32 screen_size;   // vec2 – pixel dimensions of the active target
+    s32 texture_unit;  // sampler2D – only used by the textured pipeline (-1 otherwise)
   } uniforms;
 };
 

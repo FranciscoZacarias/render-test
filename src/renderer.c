@@ -117,17 +117,14 @@ static const char *R2D_FS_Blit =
 static const char *R2D_FS_Textured =
   "#version 460 core                                          \n"
   "                                                           \n"
-  "flat in  uint      v_color;                                \n"   // texture unit index, not a color
-  "in       vec2      v_uv;                                   \n"      // NEW: we need UVs from the VS
+  "layout(location = 0) in vec2 v_uv;                        \n"  // must match VS location=0
   "out      vec4      frag_color;                             \n"
   "                                                           \n"
-  // NOTE: We use a sampler2D array so the unit is dynamically indexable.
-  // Declare enough units to cover what you'll bind (16 is plenty).
-  "uniform sampler2D u_textures[16];                          \n"
+  "uniform sampler2D u_texture;                               \n"
   "                                                           \n"
   "void main()                                                \n"
   "{                                                          \n"
-  "  frag_color = texture(u_textures[v_color], v_uv);         \n"
+  "  frag_color = texture(u_texture, v_uv);                   \n"
   "}                                                          \n";
 
 // Updated vertex shader that also emits UVs (used by the textured pipeline)
@@ -137,12 +134,11 @@ static const char *R2D_VS_UV =
   "layout(location = 0) in vec2 a_unit_pos;                   \n"
   "layout(location = 1) in vec2 a_top_left;                   \n"
   "layout(location = 2) in vec2 a_size;                       \n"
-  "layout(location = 3) in uint a_color;                      \n"   // texture unit index
+  "layout(location = 3) in uint a_color;                      \n"
   "                                                           \n"
   "uniform vec2 u_screen_size;                                \n"
   "                                                           \n"
-  "flat out uint v_color;                                     \n"
-  "out      vec2 v_uv;                                        \n"
+  "layout(location = 0) out vec2 v_uv;                        \n"  // explicit location for separable pipeline matching
   "                                                           \n"
   "out                                                        \n"
   "gl_PerVertex                                               \n"
@@ -155,8 +151,7 @@ static const char *R2D_VS_UV =
   "  vec2 ndc       = (pixel_pos / u_screen_size) * 2.0 - 1.0;\n"
   "       ndc.y     = -ndc.y;                                 \n"
   "  gl_Position = vec4(ndc, 0.0, 1.0);                       \n"
-  "  v_color     = a_color;                                   \n"
-  "  v_uv        = vec2(a_unit_pos.x, 1.0 - a_unit_pos.y);    \n"   // flip V: GL origin is bottom-left
+  "  v_uv        = vec2(a_unit_pos.x, 1.0 - a_unit_pos.y);    \n"
   "}                                                          \n";
 
 // ----------------------------------------------------------------
@@ -191,7 +186,8 @@ _r2d_build_pipeline(R2D_Pipeline *p, const char *vs_src, const char *fs_src)
 {
   p->vertex_program_handle   = _r2d_compile_shader("VS", vs_src, GL_VERTEX_SHADER);
   p->fragment_program_handle = _r2d_compile_shader("FS", fs_src, GL_FRAGMENT_SHADER);
-  p->uniforms.screen_size    = glGetUniformLocation(p->vertex_program_handle, "u_screen_size");
+  p->uniforms.screen_size    = glGetUniformLocation(p->vertex_program_handle,   "u_screen_size");
+  p->uniforms.texture_unit   = glGetUniformLocation(p->fragment_program_handle, "u_texture");  // -1 if not present
 
   glCreateProgramPipelines(1, &p->pipeline_handle);
   glUseProgramStages(p->pipeline_handle, GL_VERTEX_SHADER_BIT,   p->vertex_program_handle);
@@ -580,6 +576,15 @@ _r2d_flush_target(R2D_Render_Target *rt)
   u32       count  = rt->quad_count;
 
   glNamedBufferSubData(R2D_RenderContext.instance_vbo, 0, count * sizeof(R2D_Quad), slice);
+
+  // If this pipeline has a texture sampler, read the unit index from the first
+  // quad's color field and bind it. All quads in a textured batch share one unit.
+  if (pipeline->uniforms.texture_unit >= 0)
+  {
+    u32 unit = slice[0].color;
+    glProgramUniform1i(pipeline->fragment_program_handle, pipeline->uniforms.texture_unit, (s32)unit);
+  }
+
   glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0, (s32)count);
 
   R2D_RenderContext.per_frame_debug.draw_calls  += 1;
@@ -625,8 +630,9 @@ _r2d_blit_to_screen(R2D_Render_Target *rt, u32 window_width, u32 window_height)
   glProgramUniform1i(blit_fs, loc_texture, 0);
   glProgramUniform1f(blit_fs, loc_alpha, 1.0f);  // caller can change this
 
-  // No VAO needed – gl_VertexID drives the full-screen quad
-  glBindVertexArray(0);
+  // gl_VertexID drives the full-screen quad so no attributes are read, but
+  // core profile requires a non-zero VAO bound for every draw call.
+  glBindVertexArray(R2D_RenderContext.vao);
   glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
 
   R2D_RenderContext.per_frame_debug.draw_calls += 1;
