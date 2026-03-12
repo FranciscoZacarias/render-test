@@ -2,7 +2,6 @@
 
 #include "OpenGL.h"
 #include "Timing.h"
-#include "Files.h"
 #include "Art.h"
 
 #include "renderer.h"
