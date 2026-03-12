@@ -1,11 +1,9 @@
 #include "Base.h"
-#include "Platform.h"
-#include "Window.h"
+
 #include "OpenGL.h"
 #include "Timing.h"
 #include "Files.h"
 #include "Art.h"
-#include "Camera2D.h"
 
 #include "renderer.h"
 #include "renderer.c"
@@ -137,5 +135,3 @@ entry_point(Command_Line *command_line)
     clear_temporary_storage();
   }
 }
-
-
